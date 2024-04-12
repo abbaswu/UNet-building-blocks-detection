@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from tqdm import tqdm
 from torchvision import transforms
 
 from utils.data_loading import BasicDataset
@@ -15,7 +16,7 @@ from utils.utils import plot_img_and_mask
 from skimage.util import view_as_windows
 
 W_SIZE = 500
-pad_px = W_SIZE // 2
+PAD_PX = W_SIZE // 2
 
 def preprocess(mask_values, pil_img, scale, is_mask):
         w, h = pil_img.size
@@ -49,19 +50,13 @@ def preprocess(mask_values, pil_img, scale, is_mask):
             return img
 
 def generate_tiling(
-        image_path,
-        w_size=W_SIZE
+    in_img: np.ndarray, # (H, W, C)
+    w_size=W_SIZE
 ) -> np.ndarray:
     # Generate tiling images
     win_size = w_size
     pad_px = win_size // 2
 
-    # Read image
-    # >>> in_img.shape                                                                                                                                              
-    # (6373, 8269, 3)
-    # (H, W, C)
-    in_img = np.array(Image.open(image_path))
-    
     # Padding image
     img_pad = np.pad(in_img, [(pad_px,pad_px), (pad_px,pad_px), (0,0)], 'constant')
     tiles = view_as_windows(img_pad, (win_size,win_size,3), step=pad_px)
@@ -85,17 +80,23 @@ def generate_tiling(
     tiles_array = tiles_array.reshape(int(tiles_array.shape[0]/w_size), w_size, w_size, 3)
     return tiles_array
 
-def reconstruct_from_patches(patches_images, patch_size, step_size, image_size_2d, image_dtype):
+def reconstruct_from_patches(
+        patches_images,
+        patch_size,
+        step_size,
+        height_width_tuple: tuple[int, int],
+        image_dtype: type=np.uint8
+    ):
     '''Adjust to take patch images directly.
     patch_size is the size of the tiles
-    step_size should be patch_size//2
-    image_size_2d is the size of the original image
+    step2_size should be patch_size//2
+    height_width_tuple is the size of the original image
     image_dtype is the data type of the target image
 
     Most of this could be guessed using an array of patches
     (except step_size but, again, it should be should be patch_size//2)
     '''
-    i_h, i_w = np.array(image_size_2d[:2]) + (patch_size, patch_size)
+    i_h, i_w = np.array(height_width_tuple[:2]) + (patch_size, patch_size)
     p_h = p_w = patch_size
     if len(patches_images.shape) == 4:
         img = np.zeros((i_h+p_h//2, i_w+p_w//2, 3), dtype=image_dtype)
@@ -173,13 +174,19 @@ def get_output_filenames(args):
     return args.output or list(map(_generate_name, args.input))
 
 
-def mask_to_image(mask: np.ndarray, mask_values):
+def mask_to_image(
+        mask: np.ndarray,
+        mask_values # == [0, 1], or == [[...], ...]
+):
+    height = mask.shape[-2]
+    width = mask.shape[-1]
+
     if isinstance(mask_values[0], list):
-        out = np.zeros((mask.shape[-2], mask.shape[-1], len(mask_values[0])), dtype=np.uint8)
+        out = np.zeros((height, width, len(mask_values[0])), dtype=np.uint8)
     elif mask_values == [0, 1]:
-        out = np.zeros((mask.shape[-2], mask.shape[-1]), dtype=bool)
+        out = np.zeros((height, width), dtype=bool)
     else:
-        out = np.zeros((mask.shape[-2], mask.shape[-1]), dtype=np.uint8)
+        out = np.zeros((height, width), dtype=np.uint8)
 
     if mask.ndim == 3:
         mask = np.argmax(mask, axis=0)
@@ -221,14 +228,23 @@ if __name__ == '__main__':
         # then convert image format
         # then pass adequate parameter img to predict_img below
 
+        # Read image
+        # >>> in_img.shape                                                                                                                                              
+        # (6373, 8269, 3)
+        # (H, W, C)
+        in_img = np.array(Image.open(filename))
+
+        height, width, channels = in_img.shape
+
         # (884, 500, 500, 3)
         # (884, H, W, 3)
-        tiles_array_ = generate_tiling(filename)
-       
-        masks_array = []
+        tiles_array_ = generate_tiling(in_img)
+
+        # Store a list of masks generated from each tile 
+        masks_list = []
 
         # (H, W, 3)
-        for tile in tiles_array_:
+        for tile in tqdm(tiles_array_):
             # (W, H, 3)
             tile_ = Image.fromarray(tile)
 
@@ -240,12 +256,16 @@ if __name__ == '__main__':
                 device=device
             )
 
-            masks_array.append(mask)
+            masks_list.append(mask)
             # TODO: can we reconstruct the image and the mask successfully? then let's work on other topics...
+
+        # Reconstruct the whole mask from the list of masks
+        masks_array = np.array(masks_list)
+        reconstructed_mask = reconstruct_from_patches(masks_array, W_SIZE, PAD_PX, (height, width))
 
         if not args.no_save:
             out_filename = out_files[i]
-            result = mask_to_image(mask, mask_values)
+            result = mask_to_image(reconstructed_mask, mask_values)
             result.save(out_filename)
             logging.info(f'Mask saved to {out_filename}')
 

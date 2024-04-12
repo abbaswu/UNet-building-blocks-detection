@@ -6,3 +6,4 @@ checkpoints/
 venv/
 .idea/
 wandb/
+*.pkl
