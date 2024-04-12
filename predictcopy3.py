@@ -14,14 +14,16 @@ from utils.utils import plot_img_and_mask
 
 from skimage.util import view_as_windows
 
-w_size = 500
-pad_px = w_size // 2
+W_SIZE = 500
+pad_px = W_SIZE // 2
 
 def preprocess(mask_values, pil_img, scale, is_mask):
         w, h = pil_img.size
         newW, newH = int(scale * w), int(scale * h)
         assert newW > 0 and newH > 0, 'Scale is too small, resized images would have no pixel'
         pil_img = pil_img.resize((newW, newH), resample=Image.NEAREST if is_mask else Image.BICUBIC)
+
+        # (H, W, C)
         img = np.asarray(pil_img)
 
         if is_mask:
@@ -38,6 +40,7 @@ def preprocess(mask_values, pil_img, scale, is_mask):
             if img.ndim == 2:
                 img = img[np.newaxis, ...]
             else:
+                # img: (C, H, W)
                 img = img.transpose((2, 0, 1))
 
             if (img > 1).any():
@@ -45,24 +48,40 @@ def preprocess(mask_values, pil_img, scale, is_mask):
 
             return img
 
-def generate_tiling(image_path, w_size):
+def generate_tiling(
+        image_path,
+        w_size=W_SIZE
+) -> np.ndarray:
     # Generate tiling images
     win_size = w_size
     pad_px = win_size // 2
 
     # Read image
+    # >>> in_img.shape                                                                                                                                              
+    # (6373, 8269, 3)
+    # (H, W, C)
     in_img = np.array(Image.open(image_path))
     
     # Padding image
     img_pad = np.pad(in_img, [(pad_px,pad_px), (pad_px,pad_px), (0,0)], 'constant')
     tiles = view_as_windows(img_pad, (win_size,win_size,3), step=pad_px)
+    
+    # Iterate tiles by row and then by column
+    # Append them to tiles_lst
     tiles_lst = []
     for row in range(tiles.shape[0]):
         for col in range(tiles.shape[1]):
+            # This is one tile
             tt = tiles[row, col, 0, ...].copy()
             tiles_lst.append(tt)
+
+    # (44200, 500, 3)
+    # All the rows of the tiles
+    # (ROW NO., W, C)
     tiles_array = np.concatenate(tiles_lst)
+
     # You must reshape the tiles_array into (batch_size, width, height, 3)
+    # (884, 500, 500, 3)
     tiles_array = tiles_array.reshape(int(tiles_array.shape[0]/w_size), w_size, w_size, 3)
     return tiles_array
 
@@ -100,12 +119,16 @@ def reconstruct_from_patches(patches_images, patch_size, step_size, image_size_2
     return img[step_size//2:-(patch_size+step_size//2),step_size//2:-(patch_size+step_size//2),...]
 
 def predict_img(net,
-                full_img,
+        full_img: Image,
                 device,
                 scale_factor=1,
-                out_threshold=0.5):
+                out_threshold=0.5) -> np.ndarray:
     net.eval()
-    img = torch.from_numpy(preprocess(None, full_img, scale_factor, is_mask=False))
+
+    # (C, H, W)
+    img = torch.from_numpy(preprocess(None, full_img, scale_factor, is_mask=False).copy())
+    
+    # (N, C, H, W)
     img = img.unsqueeze(0)
     img = img.to(device=device, dtype=torch.float32)
 
@@ -113,10 +136,12 @@ def predict_img(net,
         output = net(img).cpu()
         output = F.interpolate(output, (full_img.size[1], full_img.size[0]), mode='bilinear')
         if net.n_classes > 1:
+            # Unexplored branch
             mask = output.argmax(dim=1)
         else:
             mask = torch.sigmoid(output) > out_threshold
 
+    # returns (H, W)
     return mask[0].long().squeeze().numpy()
 
 
@@ -180,6 +205,8 @@ if __name__ == '__main__':
 
     net.to(device=device)
     state_dict = torch.load(args.model, map_location=device)
+    
+    # no problem here
     mask_values = state_dict.pop('mask_values', [0, 1])
     net.load_state_dict(state_dict)
 
@@ -187,13 +214,34 @@ if __name__ == '__main__':
 
     for i, filename in enumerate(in_files):
         logging.info(f'Predicting image {filename} ...')
-        
+       
+        # TODO:
+        # read image
+        # then call generate_tiling
+        # then convert image format
+        # then pass adequate parameter img to predict_img below
 
-        mask = predict_img(net=net,
-                           full_img=img,
-                           scale_factor=args.scale,
-                           out_threshold=args.mask_threshold,
-                           device=device)
+        # (884, 500, 500, 3)
+        # (884, H, W, 3)
+        tiles_array_ = generate_tiling(filename)
+       
+        masks_array = []
+
+        # (H, W, 3)
+        for tile in tiles_array_:
+            # (W, H, 3)
+            tile_ = Image.fromarray(tile)
+
+            # (H, W)
+            mask = predict_img(net=net,
+                full_img=tile_,
+                scale_factor=args.scale,
+                out_threshold=args.mask_threshold,
+                device=device
+            )
+
+            masks_array.append(mask)
+            # TODO: can we reconstruct the image and the mask successfully? then let's work on other topics...
 
         if not args.no_save:
             out_filename = out_files[i]
